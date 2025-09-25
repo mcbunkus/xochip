@@ -68,6 +68,10 @@
 #include <stdint.h>
 #include <string.h>
 
+// TODO figure out what to do when we don't have stdlib.h. The only reason they're here is for random
+// numbers. Replace this with a better solution
+#include <stdlib.h>
+
 // =====================================================================================================================
 //    DEFINES
 // =====================================================================================================================
@@ -86,6 +90,8 @@
 #define XOCHIP_DISPLAY_WIDTH 128
 #define XOCHIP_DISPLAY_HEIGHT 64
 #define XOCHIP_DISPLAY_PIXELS (XOCHIP_DISPLAY_WIDTH * XOCHIP_DISPLAY_HEIGHT)
+
+#define XOCHIP_OPCODE_SIZE 2
 
 // Extract individual nibbles (4-bit values)
 // For opcode format: [N1][N2][N3][N4] where each N is a nibble
@@ -108,6 +114,9 @@
 // =====================================================================================================================
 //    TYPES
 // =====================================================================================================================
+
+typedef uint8_t xochip_register_t;
+typedef uint16_t xochip_address_t;
 
 typedef enum xochip_result
 {
@@ -175,7 +184,7 @@ typedef enum xochip_keys
 typedef struct xochip_stack
 {
     uint16_t addresses[16];
-    uint8_t counter;
+    xochip_register_t counter;
 } xochip_stack_t;
 
 /**
@@ -183,7 +192,8 @@ typedef struct xochip_stack
  */
 typedef struct xochip_display
 {
-    uint8_t pixels[XOCHIP_DISPLAY_PIXELS / 8]; // 8192 bits representing pixels
+    uint8_t back_plane[XOCHIP_DISPLAY_PIXELS / 8]; // 8192 bits representing pixels
+    uint8_t fore_plane[XOCHIP_DISPLAY_PIXELS / 8]; // 8192 bits representing pixels
     bool updated;
 } xochip_display_t;
 
@@ -198,7 +208,7 @@ typedef struct xochip
     uint16_t address; // address index (VI)
     uint16_t keys;    // pressed keys packed into an uint16_t for space
 
-    uint8_t registers[XOCHIP_VCOUNT];
+    xochip_register_t registers[XOCHIP_VCOUNT];
     uint8_t memory[XOCHIP_ADDRESS_SPACE_SIZE];
     xochip_stack_t stack;
 
@@ -318,21 +328,22 @@ static xochip_result_t xochip_stack_pop(xochip_stack_t *stack, uint16_t *address
 // =====================================================================================================================
 
 // clear the screen
-static xochip_result_t xochip_op_cls(xochip_t *emulator)
+inline xochip_result_t xochip_op_cls(xochip_t *emulator)
 {
-    memset(emulator->display.pixels, 0, sizeof(emulator->display.pixels));
+    memset(emulator->display.back_plane, 0, sizeof(emulator->display.back_plane));
+    memset(emulator->display.fore_plane, 0, sizeof(emulator->display.fore_plane));
     emulator->display.updated = true;
     return XOCHIP_SUCCESS;
 }
 
 // return from a subroutine
-static xochip_result_t xochip_op_ret(xochip_t *emulator)
+inline xochip_result_t xochip_op_ret(xochip_t *emulator)
 {
     return xochip_stack_pop(&emulator->stack, &emulator->counter);
 }
 
 // jump to an address
-static xochip_result_t xochip_op_jp_addr(xochip_t *emulator, uint16_t address)
+inline xochip_result_t xochip_op_jp_addr(xochip_t *emulator, uint16_t address)
 {
     if (address < XOCHIP_ADDRESS_SPACE_START)
     {
@@ -373,6 +384,148 @@ static xochip_result_t xochip_op_call(xochip_t *emulator, uint16_t address)
     return XOCHIP_SUCCESS;
 }
 
+static xochip_result_t xochip_op_se_vx_b(xochip_t *emulator, const xochip_register_t reg, const uint8_t byte)
+{
+    if (emulator->registers[reg] == byte)
+    {
+        emulator->counter += XOCHIP_OPCODE_SIZE;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_sne_vx_b(xochip_t *emulator, const xochip_register_t reg, const uint8_t byte)
+{
+    if (emulator->registers[reg] != byte)
+    {
+        emulator->counter += XOCHIP_OPCODE_SIZE;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_se_vx_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    if (emulator->registers[vx] == emulator->registers[vy])
+    {
+        emulator->counter += XOCHIP_OPCODE_SIZE;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_vx_b(xochip_t *emulator, const xochip_register_t vx, const uint8_t byte)
+{
+    emulator->registers[vx] = byte;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_add_vx_b(xochip_t *emulator, const xochip_register_t vx, const uint8_t byte)
+{
+    emulator->registers[vx] += byte;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_vx_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] = emulator->registers[vy];
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_or_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] |= emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = 0;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_and_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] &= emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = 0;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_xor_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] ^= emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = 0;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_add_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] += emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = emulator->registers[vx] <= emulator->registers[vy] ? 1 : 0;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_sub_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    // This one took more finesse to make the test ROMs happy
+    const uint8_t _vx = emulator->registers[vx];
+    const uint8_t _vy = emulator->registers[vy];
+    emulator->registers[vx] = _vx - _vy;
+    emulator->registers[XOCHIP_VF] = _vx >= _vy ? 1 : 0;
+    return XOCHIP_SUCCESS;
+}
+
+// There's some confusion on this one, SHR 1 or SHR VY?
+static xochip_result_t xochip_op_shr_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    const uint8_t carry = emulator->registers[vx] & 0x1;
+    emulator->registers[vx] >>= emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = carry;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_subn_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    emulator->registers[vx] = emulator->registers[vy] - emulator->registers[vx];
+    emulator->registers[XOCHIP_VF] = emulator->registers[vy] >= emulator->registers[vx] ? 1 : 0;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_shl_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    const uint8_t carry = (emulator->registers[vx] & 0x80) >> 7;
+    emulator->registers[vx] <<= emulator->registers[vy];
+    emulator->registers[XOCHIP_VF] = carry;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_sne_xv_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    if (emulator->registers[vx] != emulator->registers[vy])
+    {
+        emulator->counter += XOCHIP_OPCODE_SIZE;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_i(xochip_t *emulator, const xochip_address_t address)
+{
+    emulator->address = address;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_jp_v0_addr(xochip_t *emulator, const xochip_address_t address)
+{
+    emulator->address = emulator->registers[XOCHIP_V0] + address;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_rnd_vx_b(xochip_t *emulator, const xochip_register_t vx, const uint8_t byte)
+{
+    const uint8_t rnd = (uint8_t)(rand() % 0xFF);
+    emulator->registers[vx] = rnd & byte;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_drw_vx_vy_n(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy,
+                                             const uint8_t height)
+{
+
+    return XOCHIP_SUCCESS;
+}
+
 // =====================================================================================================================
 //    API IMPLEMENTATIONS
 // =====================================================================================================================
@@ -393,7 +546,8 @@ xochip_result_t xochip_reset(xochip_t *emulator)
     memset(emulator->memory, 0, sizeof(emulator->memory));
     memset(emulator->registers, 0, sizeof(emulator->registers));
     memset(emulator->stack.addresses, 0, sizeof(emulator->stack.addresses));
-    memset(emulator->display.pixels, 0, sizeof(emulator->display.pixels));
+    memset(emulator->display.back_plane, 0, sizeof(emulator->display.back_plane));
+    memset(emulator->display.fore_plane, 0, sizeof(emulator->display.fore_plane));
 
     return XOCHIP_SUCCESS;
 }
@@ -436,13 +590,9 @@ xochip_result_t xochip_write_rom(xochip_t *emulator, const uint8_t *data, uint16
     return XOCHIP_SUCCESS;
 }
 
+// This trusts your emulator pointer is not null
 xochip_result_t xochip_cycle(xochip_t *emulator)
 {
-    if (!emulator)
-    {
-        return XOCHIP_ERR_NULL_POINTER;
-    }
-
     if ((emulator->counter + 1) >= XOCHIP_ADDRESS_SPACE_SIZE)
     {
         return XOCHIP_ERR_ADDRESS_OVERFLOW;
@@ -457,18 +607,16 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
     {
     case 0x0:
     {
-        if (next_instruction == 0x00E0)
+        switch (next_instruction)
         {
+        case 0x00E0:
             return xochip_op_cls(emulator);
-        }
-
-        if (next_instruction == 0x00EE)
-        {
+        case 0x00EE:
             return xochip_op_ret(emulator);
+        default:
+            // else this is a SYS command which we don't handle
+            return XOCHIP_SUCCESS;
         }
-
-        // else this is a SYS command which we don't handle
-        return XOCHIP_SUCCESS;
     }
     case 0x1:
     {
@@ -479,6 +627,92 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
     {
         const uint16_t address = OPCODE_NNN(next_instruction);
         return xochip_op_call(emulator, address);
+    }
+    case 0x3:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const uint8_t byte = OPCODE_KK(next_instruction);
+        return xochip_op_se_vx_b(emulator, vx, byte);
+    }
+    case 0x4:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const uint8_t byte = OPCODE_KK(next_instruction);
+        return xochip_op_sne_vx_b(emulator, vx, byte);
+    }
+    case 0x5:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const xochip_register_t vy = OPCODE_Y(next_instruction);
+        return xochip_op_se_vx_vy(emulator, vx, vy);
+    }
+    case 0x6:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const uint8_t byte = OPCODE_KK(next_instruction);
+        return xochip_op_ld_vx_b(emulator, vx, byte);
+    }
+    case 0x7:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const uint8_t byte = OPCODE_KK(next_instruction);
+        return xochip_op_add_vx_b(emulator, vx, byte);
+    }
+    case 0x8:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const xochip_register_t vy = OPCODE_Y(next_instruction);
+
+        switch (OPCODE_N(next_instruction))
+        {
+        case 0x0:
+            return xochip_op_ld_vx_vy(emulator, vx, vy);
+        case 0x1:
+            return xochip_op_or_xv_vy(emulator, vx, vy);
+        case 0x2:
+            return xochip_op_and_xv_vy(emulator, vx, vy);
+        case 0x3:
+            return xochip_op_xor_xv_vy(emulator, vx, vy);
+        case 0x4:
+            return xochip_op_add_xv_vy(emulator, vx, vy);
+        case 0x5:
+            return xochip_op_sub_xv_vy(emulator, vx, vy);
+        case 0x6:
+            return xochip_op_shr_xv_vy(emulator, vx, vy);
+        case 0x7:
+            return xochip_op_subn_xv_vy(emulator, vx, vy);
+        case 0xE:
+            return xochip_op_shl_xv_vy(emulator, vx, vy);
+        default:
+            return XOCHIP_ERR_INVALID_INSTRUCTION;
+        }
+    }
+    case 0x9:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const xochip_register_t vy = OPCODE_Y(next_instruction);
+        return xochip_op_sne_xv_vy(emulator, vx, vy);
+    }
+    case 0xA:
+    {
+        return xochip_op_ld_i(emulator, OPCODE_NNN(next_instruction));
+    }
+    case 0xB:
+    {
+        return xochip_op_jp_v0_addr(emulator, OPCODE_NNN(next_instruction));
+    }
+    case 0xC:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const uint8_t byte = OPCODE_KK(next_instruction);
+        return xochip_op_rnd_vx_b(emulator, vx, byte);
+    }
+    case 0xD:
+    {
+        const xochip_register_t vx = OPCODE_X(next_instruction);
+        const xochip_register_t vy = OPCODE_X(next_instruction);
+        const uint8_t height = OPCODE_N4(next_instruction);
+        return xochip_op_drw_vx_vy_n(emulator, vx, vy, height);
     }
     default:
         return XOCHIP_ERR_INVALID_INSTRUCTION;
