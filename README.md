@@ -2,9 +2,9 @@
 
 A small, single-header, embeddable XO-CHIP/CHIP-8 emulator.
 
-XOCHIP is designed to be embedded in existing projects. I originally created it for making physical handheld XO-CHIP
-emulators on microcontrollers and physical buttons/displays. I didn't want to rewrite the hard parts for each platform,
-so I created an emulator with just enough API functions to make it flexible.
+XOCHIP is designed to be embedded in existing projects. I originally created it for physical handheld XO-CHIP emulators
+on microcontrollers with physical buttons/displays. I didn't want to rewrite the hard parts for each platform, so I
+created an emulator with just enough API functions to make it flexible.
 
 This project includes an optional SDL3 desktop demo build with CMake. However, all you need for your project is to
 include `xochip.h`. Include as needed and define `XOCHIP_IMPLEMENTATION` in exactly one C/C++ translation unit to
