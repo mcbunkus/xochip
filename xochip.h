@@ -79,7 +79,7 @@
 // XO-CHIP address space is 64kb vs the original CHIP-8's 4kb. However, like the original CHIP-8, the first 512 bytes is
 // traditionally reserved for the interpreter. We don't need that, and since this is meant for resource constrained
 // systems, we don't want to waste those bytes. 0xFE00 is 0x10000 - 0x200, or 64kb without the 512 wasted bytes.
-#define XOCHIP_ADDRESS_SPACE_SIZE 0xFE00
+#define XOCHIP_ADDRESS_SPACE_SIZE 0x10000
 
 // Where the address space would traditionally start. This value is applied to address operations as needed, to account
 // for the "missing" 512 bytes.
@@ -91,11 +91,15 @@
 #define XOCHIP_DISPLAY_HEIGHT 64
 #define XOCHIP_DISPLAY_PIXELS (XOCHIP_DISPLAY_WIDTH * XOCHIP_DISPLAY_HEIGHT)
 
+// XO-CHIP fonts are 5 rows tall, therefore 5 bytes
+#define XOCHIP_FONT_SIZE 5
+
+// XO-CHIP instruction size
 #define XOCHIP_OPCODE_SIZE 2
 
 // Creates the mask needed for doing bitwise operations on the pressed/released key integers acting as bit fields for
 // the keys
-#define XOCHIP_KEY(key) (((uint16_t)0x1) << (key))
+#define XOCHIP_KEY(key) (((uint16_t)0x01) << (key))
 
 // Extract individual nibbles (4-bit values)
 // For opcode format: [N1][N2][N3][N4] where each N is a nibble
@@ -159,6 +163,7 @@ typedef enum xochip_registers
     XOCHIP_VE,
     XOCHIP_VF,     // used for flags, context dependent upon previous instruction:wa
     XOCHIP_VSOUND, // sound timer (>0 means play sound, usually ticked down at 60 Hz)
+    XOCHIP_VPITCH, // pitch of audio playback (4000 * 2 ^ ((vx - 64) / 48))
     XOCHIP_VDELAY, // delay timer (usually ticked down at 60 Hz)
     XOCHIP_VCOUNT  // just a sentinel value, not a register
 } xochip_registers_t;
@@ -184,6 +189,7 @@ typedef enum xochip_keys
     XOCHIP_KEYD,
     XOCHIP_KEYE,
     XOCHIP_KEYF,
+    XOCHIP_KEYCOUNT,
 } xochip_keys_t;
 
 /**
@@ -202,6 +208,7 @@ typedef struct xochip_display
 {
     uint8_t back_plane[XOCHIP_DISPLAY_PIXELS / 8]; // 8192 bits representing pixels
     uint8_t fore_plane[XOCHIP_DISPLAY_PIXELS / 8]; // 8192 bits representing pixels
+    uint8_t selected_plane;
     bool updated;
 } xochip_display_t;
 
@@ -222,6 +229,7 @@ typedef struct xochip
     xochip_stack_t stack;
 
     xochip_display_t display; // the pixel display buffer
+    uint8_t audio[16];        // audio buffer, 16 bytes per spec
 } xochip_t;
 
 // =====================================================================================================================
@@ -287,16 +295,23 @@ xochip_result_t xochip_write_rom(xochip_t *emulator, const uint8_t *data, uint16
 xochip_result_t xochip_cycle(xochip_t *emulator);
 
 /**
+ * @brief Tick the emulators various timers down. It's recommended you call this function at 60 Hz, since that is what
+ * the original CHIP-8s did. This function will always succeed.
+ * @param emulator A non-null pointer to an emulator
+ */
+void xochip_tick(xochip_t *emulator);
+
+/**
  * @brief Instruct the emulator that a key has been released
  * @param emulator A non-null pointer to an emulator
- * @param key The key that was just released
+ * @param key The key that was just released. If the key is not in the range defined by xochip_keys_t, it is ignored
  */
 void xochip_key_up(xochip_t *emulator, xochip_keys_t key);
 
 /**
  * @brief Instruct the emulator that a key has been pressed
  * @param emulator A non-null pointer to an emulator
- * @param key The key that was just pressed
+ * @param key The key that was just pressed. If the key is not in the range defined by xochip_keys_t, it is ignored
  */
 void xochip_key_down(xochip_t *emulator, xochip_keys_t key);
 
@@ -356,11 +371,6 @@ static xochip_result_t xochip_stack_pop(xochip_stack_t *stack, uint16_t *address
 // Used for checking released keys in emulator->released_keys
 static int8_t xochip_find_first_set_bit(uint16_t value)
 {
-    if (!value)
-    {
-        return -1;
-    }
-
     int8_t pos = 0;
 
     // Check lower byte first (usually faster on 8-bit MCUs)
@@ -651,7 +661,94 @@ static xochip_result_t xochip_op_add_i_vx(xochip_t *emulator, const xochip_regis
 
 static xochip_result_t xochip_op_ld_f_vx(xochip_t *emulator, const xochip_register_t vx)
 {
-    uint8_t digit = emulator->registers[vx];
+    const uint8_t digit = emulator->registers[vx];
+    emulator->address = digit * XOCHIP_FONT_SIZE;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_b_vx(xochip_t *emulator, const xochip_register_t vx)
+{
+    const xochip_address_t VI = emulator->address;
+    uint8_t value = emulator->registers[vx];
+    emulator->memory[VI + 2] = value % 10;
+    value /= 10;
+    emulator->memory[VI + 1] = value % 10;
+    value /= 10;
+    emulator->memory[VI] = value % 10;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_i_vx(xochip_t *emulator, const xochip_register_t vx)
+{
+    for (xochip_register_t reg = 0; reg <= emulator->registers[vx]; ++reg)
+    {
+        emulator->memory[emulator->address] = emulator->registers[reg];
+        emulator->address++;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_vx_i(xochip_t *emulator, const xochip_register_t vx)
+{
+    for (xochip_register_t reg = 0; reg <= emulator->registers[vx]; ++reg)
+    {
+        emulator->registers[reg] = emulator->memory[emulator->address];
+        emulator->address++;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+// =====================================================================================================================
+//    XO-CHIP EXTENSION OP-CODES
+// =====================================================================================================================
+
+static xochip_result_t xochip_op_save_vx_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    const xochip_register_t start = min(vx, vy);
+    const xochip_register_t end = max(vx, vy);
+
+    for (xochip_register_t reg = start; reg <= end; ++reg)
+    {
+        emulator->memory[emulator->address] = emulator->registers[reg];
+        emulator->address++;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_load_vx_vy(xochip_t *emulator, const xochip_register_t vx, const xochip_register_t vy)
+{
+    const xochip_register_t start = min(vx, vy);
+    const xochip_register_t end = max(vx, vy);
+
+    for (xochip_register_t reg = start; reg <= end; ++reg)
+    {
+        emulator->registers[reg] = emulator->memory[emulator->address];
+        emulator->address++;
+    }
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_ld_i_long(xochip_t *emulator, const xochip_address_t addr)
+{
+    emulator->address = addr;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_plane(xochip_t *emulator, const uint8_t plane)
+{
+    emulator->display.selected_plane = plane;
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_audio(xochip_t *emulator)
+{
+    memcpy(emulator->audio, &emulator->memory[emulator->address], sizeof(emulator->audio));
+    return XOCHIP_SUCCESS;
+}
+
+static xochip_result_t xochip_op_pitch(xochip_t *emulator, const xochip_register_t vx)
+{
+    emulator->registers[XOCHIP_VPITCH] = emulator->registers[vx];
     return XOCHIP_SUCCESS;
 }
 
@@ -781,7 +878,22 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
     {
         const xochip_register_t vx = OPCODE_X(next_instruction);
         const xochip_register_t vy = OPCODE_Y(next_instruction);
-        result = xochip_op_se_vx_vy(emulator, vx, vy);
+
+        switch (OPCODE_N(next_instruction))
+        {
+        case 0x0:
+            result = xochip_op_se_vx_vy(emulator, vx, vy);
+            break;
+        case 0x2:
+            result = xochip_op_save_vx_vy(emulator, vx, vy);
+            break;
+        case 0x3:
+            result = xochip_op_load_vx_vy(emulator, vx, vy);
+            break;
+        default:
+            result = XOCHIP_ERR_INVALID_INSTRUCTION;
+            break;
+        }
         break;
     }
     case 0x6:
@@ -836,6 +948,7 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
             result = XOCHIP_ERR_INVALID_INSTRUCTION;
             break;
         }
+        break;
     }
     case 0x9:
     {
@@ -885,12 +998,29 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
             result = XOCHIP_ERR_INVALID_INSTRUCTION;
             break;
         }
+        break;
     }
     case 0xF:
     {
+        if (next_instruction == 0xF000)
+        {
+            emulator->counter += XOCHIP_OPCODE_SIZE;
+            const uint16_t new_addr =
+                (emulator->memory[emulator->counter] << 8) | (emulator->memory[emulator->counter + 1]);
+            result = xochip_op_ld_i_long(emulator, new_addr);
+            break;
+        }
+
         const xochip_register_t vx = OPCODE_X(next_instruction);
+
         switch (OPCODE_KK(next_instruction))
         {
+        case 0x01:
+            result = xochip_op_plane(emulator, OPCODE_X(next_instruction));
+            break;
+        case 0x02:
+            result = xochip_op_audio(emulator);
+            break;
         case 0x07:
             result = xochip_op_ld_vx_dt(emulator, vx);
             break;
@@ -906,10 +1036,26 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
         case 0x1E:
             result = xochip_op_add_i_vx(emulator, vx);
             break;
+        case 0x29:
+            result = xochip_op_ld_f_vx(emulator, vx);
+            break;
+        case 0x3a:
+            result = xochip_op_pitch(emulator, vx);
+            break;
+        case 0x33:
+            result = xochip_op_ld_b_vx(emulator, vx);
+            break;
+        case 0x55:
+            result = xochip_op_ld_i_vx(emulator, vx);
+            break;
+        case 0x65:
+            result = xochip_op_ld_vx_i(emulator, vx);
+            break;
         default:
             result = XOCHIP_ERR_INVALID_INSTRUCTION;
             break;
         }
+        break;
     }
     default:
         result = XOCHIP_ERR_INVALID_INSTRUCTION;
@@ -920,8 +1066,34 @@ xochip_result_t xochip_cycle(xochip_t *emulator)
     return result;
 }
 
-void xochip_key_up(xochip_t *emulator, xochip_keys_t key) { emulator->released_keys |= XOCHIP_KEY(key); }
-void xochip_key_down(xochip_t *emulator, xochip_keys_t key) { emulator->pressed_keys |= XOCHIP_KEY(key); }
+void xochip_tick(xochip_t *emulator)
+{
+    if (emulator->registers[XOCHIP_VSOUND] > 0)
+    {
+        emulator->registers[XOCHIP_VSOUND]--;
+    }
+
+    if (emulator->registers[XOCHIP_VDELAY] > 0)
+    {
+        emulator->registers[XOCHIP_VDELAY]--;
+    }
+}
+
+void xochip_key_up(xochip_t *emulator, xochip_keys_t key)
+{
+    if (key < XOCHIP_KEYCOUNT)
+    {
+        emulator->released_keys |= XOCHIP_KEY(key);
+    }
+}
+
+void xochip_key_down(xochip_t *emulator, xochip_keys_t key)
+{
+    if (key < XOCHIP_KEYCOUNT)
+    {
+        emulator->pressed_keys |= XOCHIP_KEY(key);
+    }
+}
 
 const char *xochip_strerror(const xochip_result_t err)
 {
