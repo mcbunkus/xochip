@@ -767,6 +767,7 @@ xochip_result_t xochip_reset(xochip_t *emulator)
     emulator->counter = 0;
     emulator->address = 0;
     emulator->pressed_keys = 0;
+    emulator->released_keys = 0;
     emulator->stack.counter = 0;
 
     memset(emulator->memory, 0, sizeof(emulator->memory));
@@ -819,10 +820,6 @@ xochip_result_t xochip_write_rom(xochip_t *emulator, const uint8_t *data, uint16
 // This trusts your emulator pointer is not null
 xochip_result_t xochip_cycle(xochip_t *emulator)
 {
-    if ((emulator->counter + 1) >= XOCHIP_ADDRESS_SPACE_SIZE)
-    {
-        return XOCHIP_ERR_ADDRESS_OVERFLOW;
-    }
 
     const uint16_t next_instruction =
         (emulator->memory[emulator->counter] << 8) | (emulator->memory[emulator->counter + 1]);
@@ -1084,6 +1081,7 @@ void xochip_key_up(xochip_t *emulator, xochip_keys_t key)
     if (key < XOCHIP_KEYCOUNT)
     {
         emulator->released_keys |= XOCHIP_KEY(key);
+        emulator->pressed_keys &= ~XOCHIP_KEY(key);
     }
 }
 
@@ -1092,6 +1090,7 @@ void xochip_key_down(xochip_t *emulator, xochip_keys_t key)
     if (key < XOCHIP_KEYCOUNT)
     {
         emulator->pressed_keys |= XOCHIP_KEY(key);
+        emulator->released_keys &= ~XOCHIP_KEY(key);
     }
 }
 
